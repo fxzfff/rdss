@@ -1,0 +1,124 @@
+name: Ubuntu RDP via Tailscale
+
+on:
+  workflow_dispatch:
+
+# Tailscale workload identity ke liye required permission.
+# Agar aap auth-key method use kar rahe hain, to is permission ko hata sakte hain.
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  RDP_USER: rdp
+  # GitHub repository Secret: RDP_PASSWORD
+  RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+
+jobs:
+  linux-rdp:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Validate required secret
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ -z "${RDP_PASSWORD:-}" ]]; then
+            echo "::error::RDP_PASSWORD secret is missing."
+            exit 1
+          fi
+          if [[ "${#RDP_PASSWORD}" -lt 12 ]]; then
+            echo "::error::RDP_PASSWORD must contain at least 12 characters."
+            exit 1
+          fi
+
+      - name: Install XFCE desktop and xRDP
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xfce4 xfce4-goodies xrdp dbus-x11
+
+          sudo systemctl enable xrdp
+
+          # xRDP session ko lightweight XFCE desktop par start karna.
+          sudo tee /etc/xrdp/startwm.sh >/dev/null <<'EOF'
+          #!/bin/sh
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_SESSION_DESKTOP=xfce
+          export XDG_CONFIG_DIRS=/etc/xdg/xdg-xfce:/etc/xdg
+          export XDG_DATA_DIRS=/usr/share/xfce4:/usr/local/share:/usr/share
+          exec startxfce4
+          EOF
+          sudo chmod 0755 /etc/xrdp/startwm.sh
+
+      - name: Create non-root RDP user
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if id "$RDP_USER" >/dev/null 2>&1; then
+            sudo userdel -r "$RDP_USER" || true
+          fi
+
+          sudo useradd --create-home --shell /bin/bash "$RDP_USER"
+          printf '%s:%s\n' "$RDP_USER" "$RDP_PASSWORD" | sudo chpasswd
+
+          # XFCE ko RDP user ke default session ke roop mein set karna.
+          sudo -u "$RDP_USER" bash -c 'printf "%s\n" "startxfce4" > "$HOME/.xsession"'
+          sudo chown "$RDP_USER:$RDP_USER" "/home/$RDP_USER/.xsession"
+          sudo chmod 0644 "/home/$RDP_USER/.xsession"
+
+      - name: Connect runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          # GitHub Secret: TAILSCALE_AUTH_KEY
+          # Is key ko tagged, reusable aur ephemeral rakhna recommended hai.
+          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+
+      - name: Restrict xRDP to Tailscale interface
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo systemctl restart xrdp
+
+          # RDP ko public interfaces par expose na karke sirf tailscale0 par allow karein.
+          sudo iptables -A INPUT -i tailscale0 -p tcp --dport 3389 -j ACCEPT
+          sudo iptables -A INPUT -p tcp --dport 3389 -j DROP
+
+          TAILSCALE_IP="$(tailscale ip -4 | head -n 1)"
+          if [[ -z "$TAILSCALE_IP" ]]; then
+            echo "::error::Tailscale IPv4 address nahi mila."
+            exit 1
+          fi
+          echo "TAILSCALE_IP=$TAILSCALE_IP" >> "$GITHUB_ENV"
+
+      - name: Verify xRDP service
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo systemctl --no-pager --full status xrdp
+          sudo ss -lntp | grep -E ':3389\b'
+          echo "RDP service Tailscale IP $TAILSCALE_IP par configured hai."
+
+      - name: Display connection address
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "=== LINUX RDP ACCESS ==="
+          echo "Address: $TAILSCALE_IP"
+          echo "Username: $RDP_USER"
+          echo "Password: GitHub Secret RDP_PASSWORD mein stored hai"
+          echo "========================"
+
+      - name: Keep runner active
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          while true; do
+            echo "[$(date -Is)] Linux RDP active"
+            sleep 300
+          done
+          
