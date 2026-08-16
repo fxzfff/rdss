@@ -101,6 +101,6 @@ jobs:
 
           while true; do
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] RDP Active - Use Ctrl+C in workflow to terminate"
-            slee
-            p 300
+            sleep 300
           done
+          
