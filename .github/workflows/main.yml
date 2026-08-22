@@ -1,105 +1,136 @@
-name: RDP Linux
+name: Linux RDP
 
 on:
   workflow_dispatch:
 
 env:
+  # Change this password before using, or preferably replace it with a GitHub Secret.
   RDP_PASSWORD: "YourSecurePassword123!"
 
 jobs:
-  secure-rdp:
+  linux-rdp:
     runs-on: ubuntu-latest
-    timeout-minutes: 3600
+    timeout-minutes: 360
 
     steps:
-      - name: Install Desktop Environment & XRDP
+      - name: Install Desktop and XRDP
+        shell: bash
         run: |
-          export DEBIAN_FRONTEND=noninteractive
+          set -e
           sudo apt-get update
-          sudo apt-get install -y xfce4 xfce4-goodies xrdp dbus-x11
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xrdp \
+            xfce4 \
+            xfce4-goodies \
+            dbus-x11
 
-          # Configure XRDP to use XFCE
-          echo "xfce4-session" | tee ~/.xsession
-          sudo sed -i 's/^test -x \/etc\/X11\/Xsession/#&/' /etc/xrdp/startwm.sh
-          echo -e "#!/bin/bash\nstartxfce4" | sudo tee /etc/xrdp/startwm.sh
-          sudo chmod +x /etc/xrdp/startwm.sh
+          echo "xfce4-session" | sudo tee /etc/skel/.xsession
 
-          # Fix permissions
-          sudo adduser xrdp ssl-cert 2>/dev/null || true
-
-          # Start XRDP services
-          sudo service xrdp start
-          sudo service xrdp-sesman start
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp
 
       - name: Create RDP User
+        shell: bash
         run: |
-          USERNAME="rdpuser"
-          PASSWORD="$RDP_PASSWORD"
+          set -e
 
-          if id "$USERNAME" &>/dev/null; then
-            sudo userdel -r "$USERNAME" 2>/dev/null || true
+          USERNAME="rdp"
+
+          if id "$USERNAME" >/dev/null 2>&1; then
+            sudo userdel -r "$USERNAME" || true
           fi
 
           sudo useradd -m -s /bin/bash "$USERNAME"
-          echo "$USERNAME:$PASSWORD" | sudo chpasswd
+          echo "$USERNAME:$RDP_PASSWORD" | sudo chpasswd
           sudo usermod -aG sudo "$USERNAME"
 
-          # Enable passwordless sudo for the workflow session
-          echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/99-rdp-user
-          sudo chmod 440 /etc/sudoers.d/99-rdp-user
+          echo "xfce4-session" | sudo tee /home/$USERNAME/.xsession
+          sudo chown "$USERNAME:$USERNAME" /home/$USERNAME/.xsession
 
-          echo "RDP_CREDS=User: $USERNAME | Password: $PASSWORD" >> "$GITHUB_ENV"
+          # Allow passwordless sudo for this temporary runner user.
+          echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$USERNAME
+          sudo chmod 440 /etc/sudoers.d/$USERNAME
+
+      - name: Configure XRDP
+        shell: bash
+        run: |
+          set -e
+
+          # XRDP listens on TCP 3389 by default.
+          sudo sed -i 's/^port=.*/port=3389/' /etc/xrdp/xrdp.ini
+
+          # Add xrdp user to ssl-cert group when available.
+          sudo adduser xrdp ssl-cert || true
+
+          sudo systemctl restart xrdp
+          sudo systemctl --no-pager --full status xrdp || true
 
       - name: Install Tailscale
+        shell: bash
         run: |
+          set -e
           curl -fsSL https://tailscale.com/install.sh | sh
 
       - name: Establish Tailscale Connection
+        shell: bash
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          sudo tailscale up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="gh-runner-linux-$GITHUB_RUN_ID"
+          set -e
+
+          sudo tailscale up \
+            --authkey="$TAILSCALE_AUTH_KEY" \
+            --hostname="gh-linux-${GITHUB_RUN_ID}"
 
           TS_IP=""
-          RETRIES=0
-          while [ -z "$TS_IP" ] && [ "$RETRIES" -lt 10 ]; do
-            TS_IP=$(sudo tailscale ip -4 2>/dev/null || true)
+          for i in {1..10}; do
+            TS_IP="$(tailscale ip -4 | head -n1 || true)"
+            if [ -n "$TS_IP" ]; then
+              break
+            fi
             sleep 5
-            RETRIES=$((RETRIES + 1))
           done
 
           if [ -z "$TS_IP" ]; then
-            echo "Tailscale IP not assigned. Exiting."
+            echo "Tailscale IP not assigned."
             exit 1
           fi
 
           echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
-          echo "Tailscale IP: $TS_IP"
 
       - name: Verify RDP Accessibility
+        shell: bash
         run: |
+          set -e
+
           echo "Tailscale IP: $TAILSCALE_IP"
 
-          if command -v nc >/dev/null 2>&1; then
-            if nc -zv "$TAILSCALE_IP" 3389; then
-              echo "TCP connectivity successful!"
-            else
-              echo "Warning: Port 3389 not reachable yet, but XRDP is running."
+          for i in {1..12}; do
+            if nc -z "$TAILSCALE_IP" 3389; then
+              echo "RDP port 3389 is reachable."
+              exit 0
             fi
-          else
-            echo "nc not available, skipping TCP test."
-          fi
+            sleep 5
+          done
+
+          echo "RDP port 3389 is not reachable."
+          exit 1
 
       - name: Maintain Connection
+        shell: bash
         run: |
           echo ""
-          echo "=== RDP ACCESS ==="
-          echo "Address:  $TAILSCALE_IP"
-          echo "Username: rdpuser"
+          echo "========== LINUX RDP ACCESS =========="
+          echo "Address : $TAILSCALE_IP"
+          echo "Username: rdp"
           echo "Password: $RDP_PASSWORD"
-          echo "Desktop:  XFCE4"
-          echo "=================="
+          echo "Desktop : XFCE"
+          echo "Port    : 3389"
+          echo "======================================"
           echo ""
 
           while true; do
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] RDP Active - Use Ctrl+C in workflow to terminate"
+            echo "[$(date)] Linux RDP Active - cancel workflow to stop"
             sleep 300
           done
+          
