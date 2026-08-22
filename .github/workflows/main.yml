@@ -1,42 +1,45 @@
-name: Linux RDP
+name: Linux RDP (Stable XRDP)
 
 on:
   workflow_dispatch:
 
 env:
-  # Change this password before using, or preferably replace it with a GitHub Secret.
   RDP_PASSWORD: "YourSecurePassword123!"
 
 jobs:
   linux-rdp:
-    runs-on: ubuntu-latest
+    # Pin the OS instead of ubuntu-latest so XRDP behavior does not change unexpectedly.
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
 
     steps:
-      - name: Install Desktop and XRDP
+      - name: Install XFCE, XRDP and Xorg backend
         shell: bash
         run: |
-          set -e
+          set -euxo pipefail
+
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             xrdp \
+            xorgxrdp \
+            xserver-xorg-core \
             xfce4 \
             xfce4-goodies \
-            dbus-x11
+            dbus-x11 \
+            netcat-openbsd
 
-          echo "xfce4-session" | sudo tee /etc/skel/.xsession
+          # XRDP needs access to its TLS private key.
+          sudo adduser xrdp ssl-cert || true
 
-          sudo systemctl enable xrdp
-          sudo systemctl restart xrdp
-
-      - name: Create RDP User
+      - name: Create RDP user
         shell: bash
         run: |
-          set -e
+          set -euxo pipefail
 
           USERNAME="rdp"
 
           if id "$USERNAME" >/dev/null 2>&1; then
+            sudo pkill -u "$USERNAME" || true
             sudo userdel -r "$USERNAME" || true
           fi
 
@@ -44,93 +47,146 @@ jobs:
           echo "$USERNAME:$RDP_PASSWORD" | sudo chpasswd
           sudo usermod -aG sudo "$USERNAME"
 
-          echo "xfce4-session" | sudo tee /home/$USERNAME/.xsession
-          sudo chown "$USERNAME:$USERNAME" /home/$USERNAME/.xsession
+          # XFCE session used by XRDP.
+          echo "startxfce4" | sudo tee "/home/$USERNAME/.xsession" >/dev/null
+          sudo chown "$USERNAME:$USERNAME" "/home/$USERNAME/.xsession"
+          sudo chmod 644 "/home/$USERNAME/.xsession"
 
-          # Allow passwordless sudo for this temporary runner user.
-          echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$USERNAME
-          sudo chmod 440 /etc/sudoers.d/$USERNAME
+          # Temporary runner only.
+          echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/$USERNAME" >/dev/null
+          sudo chmod 440 "/etc/sudoers.d/$USERNAME"
 
-      - name: Configure XRDP
+      - name: Configure XRDP session startup
         shell: bash
         run: |
-          set -e
+          set -euxo pipefail
 
-          # XRDP listens on TCP 3389 by default.
+          # A clean XRDP/XFCE startup avoids the common black-screen /
+          # immediate-disconnect problem caused by inherited DBus/runtime vars.
+          sudo tee /etc/xrdp/startwm.sh >/dev/null <<'EOF'
+          #!/bin/sh
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_SESSION_DESKTOP=xfce
+          export DESKTOP_SESSION=xfce
+          exec dbus-launch --exit-with-session startxfce4
+          EOF
+          sudo chmod 755 /etc/xrdp/startwm.sh
+
+          # Keep the Xorg backend enabled and use normal RDP port.
           sudo sed -i 's/^port=.*/port=3389/' /etc/xrdp/xrdp.ini
 
-          # Add xrdp user to ssl-cert group when available.
-          sudo adduser xrdp ssl-cert || true
+          # Clean stale sessions quickly so reconnects do not get stuck/crash.
+          if grep -q '^KillDisconnected=' /etc/xrdp/sesman.ini; then
+            sudo sed -i 's/^KillDisconnected=.*/KillDisconnected=true/' /etc/xrdp/sesman.ini
+          else
+            sudo sed -i '/^\[Sessions\]/a KillDisconnected=true' /etc/xrdp/sesman.ini
+          fi
 
-          sudo systemctl restart xrdp
-          sudo systemctl --no-pager --full status xrdp || true
+          if grep -q '^DisconnectedTimeLimit=' /etc/xrdp/sesman.ini; then
+            sudo sed -i 's/^DisconnectedTimeLimit=.*/DisconnectedTimeLimit=60/' /etc/xrdp/sesman.ini
+          else
+            sudo sed -i '/^\[Sessions\]/a DisconnectedTimeLimit=60' /etc/xrdp/sesman.ini
+          fi
+
+          sudo systemctl enable xrdp xrdp-sesman
+          sudo systemctl restart xrdp-sesman xrdp
+
+          sleep 3
+          sudo systemctl --no-pager --full status xrdp xrdp-sesman || true
+          sudo ss -lntp | grep ':3389' || true
 
       - name: Install Tailscale
         shell: bash
         run: |
-          set -e
+          set -euxo pipefail
           curl -fsSL https://tailscale.com/install.sh | sh
 
-      - name: Establish Tailscale Connection
+      - name: Connect Tailscale
         shell: bash
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          set -e
+          set -euxo pipefail
+
+          if [ -z "${TAILSCALE_AUTH_KEY:-}" ]; then
+            echo "TAILSCALE_AUTH_KEY secret is missing."
+            exit 1
+          fi
 
           sudo tailscale up \
             --authkey="$TAILSCALE_AUTH_KEY" \
             --hostname="gh-linux-${GITHUB_RUN_ID}"
 
           TS_IP=""
-          for i in {1..10}; do
+          for i in {1..15}; do
             TS_IP="$(tailscale ip -4 | head -n1 || true)"
-            if [ -n "$TS_IP" ]; then
-              break
-            fi
-            sleep 5
+            [ -n "$TS_IP" ] && break
+            sleep 3
           done
 
           if [ -z "$TS_IP" ]; then
-            echo "Tailscale IP not assigned."
+            echo "Tailscale IP was not assigned."
+            tailscale status || true
             exit 1
           fi
 
           echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
 
-      - name: Verify RDP Accessibility
+      - name: Verify XRDP
         shell: bash
         run: |
-          set -e
+          set -euxo pipefail
 
           echo "Tailscale IP: $TAILSCALE_IP"
 
+          # Local port test first.
+          nc -z 127.0.0.1 3389
+
+          # Then verify using the Tailscale address.
           for i in {1..12}; do
             if nc -z "$TAILSCALE_IP" 3389; then
-              echo "RDP port 3389 is reachable."
+              echo "XRDP is reachable on $TAILSCALE_IP:3389"
               exit 0
             fi
             sleep 5
           done
 
-          echo "RDP port 3389 is not reachable."
+          echo "XRDP is not reachable. Diagnostics:"
+          sudo journalctl -u xrdp -u xrdp-sesman --no-pager -n 150 || true
           exit 1
 
-      - name: Maintain Connection
+      - name: Keep RDP alive and show crash logs
         shell: bash
         run: |
+          set +e
+
           echo ""
           echo "========== LINUX RDP ACCESS =========="
           echo "Address : $TAILSCALE_IP"
           echo "Username: rdp"
           echo "Password: $RDP_PASSWORD"
-          echo "Desktop : XFCE"
           echo "Port    : 3389"
+          echo "Session : Xorg / XFCE"
           echo "======================================"
           echo ""
+          echo "If the RDP client disconnects, XRDP logs will appear below."
+          echo ""
+
+          # Stream XRDP logs into the GitHub Actions log. This makes any
+          # session crash visible immediately without SSH access.
+          sudo journalctl -u xrdp -u xrdp-sesman -f --no-pager &
+          LOG_PID=$!
+
+          trap 'sudo kill "$LOG_PID" 2>/dev/null || true; sudo tailscale logout || true' EXIT
 
           while true; do
-            echo "[$(date)] Linux RDP Active - cancel workflow to stop"
+            if ! systemctl is-active --quiet xrdp || ! systemctl is-active --quiet xrdp-sesman; then
+              echo "XRDP service stopped. Restarting..."
+              sudo systemctl restart xrdp-sesman xrdp
+            fi
+            echo "[$(date -Is)] Linux RDP active at $TAILSCALE_IP:3389"
             sleep 300
           done
           
